@@ -39,4 +39,4 @@ vignettes/*.pdf
 .Renviron
 
 # Mac OS
-# .DS_STORE
+.DS_STORE

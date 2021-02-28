@@ -40,3 +40,6 @@ vignettes/*.pdf
 
 # Mac OS
 .DS_STORE
+
+# Outputs
+*.html

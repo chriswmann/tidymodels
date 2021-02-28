@@ -9,22 +9,117 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r}
+library(glue)
+library(tidymodels)
+library(tidyverse)
 ```
 
-## Including Plots
+Load data - using the gss dataset.
+```{r}
+# Load in the dataset
+data(gss)
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Take a look at its structure
+dplyr::glimpse(gss)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+gss
+```
+Check if there is a difference in income based on gender alone.
+```{r}
+gss_data <- gss %>% 
+  mutate(income_range = income,
+         income = str_remove(income, "\\s.+"),
+         income = as.numeric(str_extract(income, "[0-9]+")))
+
+gss_data%>% 
+  group_by(sex) %>%
+  summarise(mean_income = mean(income, na.rm = TRUE))
+```
+There is certainly a large-looking difference in the means.
+```{r}
+null_dist <- gss_data %>% 
+  na.omit() %>% 
+  specify(income ~ sex) %>% 
+  hypothesise(null = "independence") %>%
+  generate(reps = 1000, type = "permute") %>%
+  calculate("diff in means", order = c("male", "female"))
+head(null_dist)
+```
+```{r}
+point_estimate <- gss_data %>%
+  group_by(sex) %>% 
+  summarise(mean_income = mean(income, na.rm = TRUE)) %>% 
+  mutate(income_diff = mean_income - lag(mean_income)) %>% 
+  na.omit() %>% 
+  select(income_diff)
+point_estimate
+```
+
+
+```{r}
+null_dist %>%
+  visualize() +
+  shade_p_value(obs_stat = point_estimate, direction = "left")
+```
+
+```{r}
+# get a two-tailed p-value
+p_value <- null_dist %>%
+  get_p_value(obs_stat = point_estimate, direction = "left")
+
+p_value
+```
+```{r}
+# start with the null distribution
+null_dist %>%
+  # calculate the confidence interval around the point estimate
+  get_confidence_interval(point_estimate = point_estimate,
+                          # at the 95% confidence level
+                          level = .95,
+                          # using the standard error
+                          type = "se")
+```
+
+
+```{r}
+gss %>%
+  specify(college ~ partyid, success = "degree") %>%
+  hypothesize(null = "independence")
+```
+
+```{r}
+null_f_distn_theoretical <- gss %>%
+   specify(age ~ partyid) %>%
+   hypothesize(null = "independence") %>%
+   calculate(stat = "F")
+null_f_distn_theoretical
+```
+
+```{r}
+F_hat <- gss %>% 
+  specify(age ~ partyid) %>%
+  calculate(stat = "F")
+```
+
+```{r}
+visualize(null_f_distn_theoretical, method = "theoretical") +
+  shade_p_value(obs_stat = F_hat, direction = "greater")
+```
+
+```{r}
+null_f_distn <- gss %>%
+   specify(age ~ partyid) %>%
+   hypothesize(null = "independence") %>%
+   generate(reps = 1000, type = "permute") %>%
+   calculate(stat = "F")
+```
+
+
+```{r}
+visualize(null_f_distn, method = "both") +
+  shade_p_value(obs_stat = F_hat, direction = "greater")
+```
+

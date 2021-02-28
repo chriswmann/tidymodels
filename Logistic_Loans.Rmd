@@ -1,0 +1,220 @@
+---
+title: "Tidymodels – Logistic Regression"
+author: "Chris Mann"
+date: "28/02/2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load libraries, set theme and seed.
+```{r load_libraries, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+theme_set(theme_light())
+set.seed(2021)
+```
+
+
+# Load and Clean Data
+```{r load_and_clean_data, message=FALSE}
+fpath <- "https://raw.githubusercontent.com/chriswmann/datasets/master/psds_data/full_train_set.csv"
+loans <- read_csv(fpath)
+head(loans)
+```
+Based on a quick look at the top of the data, we can see there are several redundant columns, all ending with an underscore, so let's drop those columns.  There are three columns to drop, so we should expect 16 columns afterwards.
+```{r drop_nugatory_columns}
+loans <- loans %>% 
+  select(!ends_with("_"))
+head(loans)
+```
+The obvious choice when modelling loan data is to try to predict when people will default.  Looking at the data, there are two columns we could potentially use: `status` and `outcome`.
+
+It also looks like the `status` and `outcome` columns are basically the same.  Let's look a little closer.
+```{r count_targets}
+loans %>% 
+  count(status, outcome)
+```
+From this we can see that `status` captures a little extra information, namely the $221$ people who have defaulted (made one or more late payments) but who have not (yet) been charged off (the lender has deemed the debt uncollectable).
+
+We'll start with binomial logistic regression and then move on to multinomial, so we'll make two copies of the data, each with one of these columns.
+
+Before we get to that, however, let's see if the `term` column's units are all months.
+```{r count_loan_terms}
+loans %>% 
+  count(term)
+```
+Indeed they are, so we'll turn this into a numeric feature as the ratio between the two durations is likely to be of value in predicting the outcome.  This could be because a shorter duration tends to be higher monthly payments and so the risk of default increases.  Or, a more simple time at risk type argument could mean more people default with longer repayment terms.  Below, we will see if we can find any evidence to indicate which of these potential mechanisms is at play.
+
+```{r convert_term_to_numeric}
+loans <- loans %>% 
+  mutate(term = parse_number(term))
+```
+
+Let's also tidy the `outcome` column values up a bit, so they're consistent with `status` and wil look nicer in plots.
+```{r tidy_outcome_values}
+loans <- loans %>% 
+  mutate(outcome = str_to_title(outcome))
+```
+
+Now we'll create those two datasets, binomial and multinomial, now.  We'll need the target features to be factors, so we'll also set those.
+```{r create_binom_and_multinom_datasets}
+loans_binomial <- loans %>% 
+  select(-status) %>% 
+  mutate(outcome = as.factor(outcome))
+
+loans_multinomial <- loans %>% 
+  select(-outcome) %>% 
+  mutate(status = as.factor(status))
+```
+
+# Train Test Split
+Before we explore the data any further, we'll split a test set to keep aside.  Because we have two categorical columns, `purpose` and `home_ownership`, we'll use stratified sampling to make sure we have examples of each class in both the training and test data.
+
+We've also seen that `outcome` and `status` are quite highly imbalanced, so we'll also stratify on `outcome` (for the binomial analysis) to ensure we have some target samples in each set.
+
+Because we want to stratify two features, we can't use `rsample::initial_split`, so we'll do it manually.
+```{r binom_train_test_split}
+train_ind <- loans_binomial %>% 
+  mutate(index = row_number()) %>% 
+  group_by(purpose, home_ownership, outcome) %>% 
+  sample_frac(size = 0.75) %>% 
+  pull(index)
+
+test <- loans_binomial[-train_ind, ]
+train <- loans_binomial[train_ind, ]
+train
+```
+So, we have `r format(nrow(train), big.mark = ",")` samples to train on.  A very healthy amount.
+
+```{r binom_skim}
+skimr::skim(train)
+```
+
+# Baseline Binomial Model
+Let's get a baseline metric with the data in its current form, so we have a metric to compare to after any feature engineering or other processing.
+
+## Create Baseline Model
+We'll use `glmnet` in case we want to apply any regularisation later.
+```{r}
+glm_spec <- logistic_reg(penalty = 0) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification") %>% 
+  translate()
+
+glm_spec
+```
+
+```{r}
+binom_glm_fit <- glm_spec %>% 
+  fit(outcome ~ ., data = train)
+
+binom_glm_fit
+```
+
+```{r}
+binom_baseline_preds <- 
+  test %>% 
+  bind_cols(
+   binom_glm_fit %>% 
+     predict(test %>% select(-outcome)) %>% 
+     rename(baseline = .pred_class)
+  ) %>% 
+  select(outcome, baseline, everything())
+binom_baseline_preds %>% 
+  metrics(truth = outcome, estimate = baseline)
+```
+
+These metrics suggest that the accuracy is being driven by the class imbalance as the Kappa statistic is so low.
+```{r}
+binom_baseline_preds %>% 
+  count(baseline) %>% 
+  mutate(prop_preds = n / sum(n)) %>% 
+  bind_cols(
+   binom_baseline_preds %>% 
+     count(outcome) %>% 
+    mutate(prop_true = n / sum(n)) 
+  ) %>% 
+  select(!starts_with("n"))
+```
+This confirms our suspicion - the model is overwhelmingly predicting `Paid Off` and, because of the large class imbalance, is still correct 81% of the time.  
+
+Let's break these results down a little more with a confusion matrix.
+```{r}
+binom_baseline_preds %>% 
+  conf_mat(truth = outcome, estimate = baseline)
+```
+So, we've correctly predicted 24,070 loans as `Paid Off`, which alone accounts for `r round(24070 / nrow(test) * 100, 1)`% of the test set.
+
+However, we've incorrectly classed 5,389 defaulted loans as `Paid Off` and a further 258 that were paid off as `Default`.
+
+Let's see if we can improve on this.  We're looking for an accuracy better than 81% in order to have done better than a naive prediction of `Paid Off`.
+
+## Improving the Binary Logistic Regression Model
+
+So, we know that the target is heavily imbalanced.  Let's see it graphically.
+```{r}
+train %>% 
+  mutate(outcome = str_to_title(outcome)) %>% 
+  ggplot(aes(outcome, fill = outcome)) +
+  geom_bar(stat = "count", show.legend = FALSE) +
+  labs(x = "Outcome",
+       y = "Count",
+       title = "How many people defaulted on their loans?")
+```
+
+We have a lot of data for a logistic regression model, so we'll try subsampling to balance the target classes.  We'll use `themis::step_downsample()` which is a recipe step specification.
+
+```{r}
+# Start reusing the recipe
+binom_recipe <- recipe(outcome ~ ., data = train) %>%
+  themis::step_downsample(outcome) %>%
+  prep(training = train, retain = TRUE)
+# Check the classes are now balanced
+sort(table(bake(binom_recipe, new_data = NULL)$outcome, useNA = "always"))
+```
+
+```{r}
+binom_glm_fit <- 
+  glm_spec %>% 
+  fit(outcome ~ ., data = bake(binom_recipe, new_data = NULL))
+binom_glm_fit
+```
+
+```{r}
+binom_preds <- 
+  test %>% 
+  bind_cols(
+   binom_glm_fit %>% 
+     predict(test %>% select(-outcome)) %>% 
+     rename(baseline = .pred_class)
+  ) %>% 
+  select(outcome, baseline, everything())
+binom_preds %>% 
+  metrics(truth = outcome, estimate = baseline)
+```
+Whilst accuracy has dropped from 81% to 65%, Kappa has increased from 0.06 to 0.19.  So whilst the accuracy is now worse than a naive estimate, the model is no longer overwhelmingly predicting `Paid Off`.  Again we'll look at a confusion matrix to see more about the predictions being made.
+
+```{r}
+binom_preds %>% 
+  conf_mat(truth = outcome, estimate = baseline)
+```
+We are now predicting many more of the `Defaults`, although this is at the expense of a lot more false positives and false negatives.
+
+```{r}
+binom_recipe %>% 
+  step_other(home_ownership, other = "the_rest") %>% 
+  step_dummy(purpose, home_ownership) %>%
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors()) %>% 
+  prep(training = train, retain = TRUE, fresh = TRUE)
+```
+
+

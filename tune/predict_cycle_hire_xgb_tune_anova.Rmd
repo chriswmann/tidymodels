@@ -1,0 +1,178 @@
+---
+title: "Tidymodels Tune"
+author: "Chris Mann"
+date: ""
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(GGally)
+library(finetune)
+library(tidymodels)
+library(tidyverse)
+```
+
+```{r}
+set.seed(2021)
+df <- read_csv("https://raw.githubusercontent.com/marcopeix/predict-bike-rentals/master/bike_rental_hour.csv")
+```
+
+First we'll split the data to keep a small test set, taking the chronologically latest 10% of the data.
+```{r}
+train_test_split_date <- as.Date(quantile(unclass(df$dteday), 0.80), origin = "1970-01-01")
+df <- df %>% 
+  arrange(dteday)
+train <- df[df$dteday <= train_test_split_date, ]
+test <- df[df$dteday > train_test_split_date, ]
+```
+
+Before we start mutating the data, we'll resample the training set for cross-validation.
+```{r}
+slid_per <- sliding_period(train, index = dteday, period = "month")
+```
+
+We'll recode the seasons and weather as well as take the sine and cosine of `hr` to encode it numerically.
+
+The seasons are:
+1. Spring
+2. Summer
+3. Autumn
+4. Winter
+
+It seems likely that more people will cycle in nicer weather and less in winter.  Let's encode season based on the average count for each season in the training data.
+
+```{r}
+seasons <- train %>% 
+  group_by(season) %>% 
+  summarise(avg_cnt = mean(cnt)) %>% 
+  mutate(levels = scale(avg_cnt)) %>% 
+  select(-avg_cnt)
+
+season_key = as.list(seasons$levels)
+names(season_key) = seasons$season
+season_key
+```
+
+Similarly for weather:
+```{r}
+weather <- train %>% 
+  group_by(weathersit) %>% 
+  summarise(avg_cnt = mean(cnt)) %>% 
+  mutate(levels = scale(avg_cnt)) %>% 
+  select(-avg_cnt)
+
+weather_key = as.list(weather$levels)
+names(weather_key) = weather$weather
+weather_key
+```
+Now we can build out recipe.
+```{r}
+rec <- df %>% 
+  recipe(cnt ~ .)
+
+rec <- rec %>% 
+  step_rm(casual, registered) %>% 
+  step_mutate(
+    season = recode(season, !!!season_key),
+    weathersit = recode(weathersit, !!!weather_key),
+    hr_sin = sin(hr),
+    hr_cos = cos(hr)
+    ) %>% 
+  step_date(dteday) %>% 
+  step_rm(dteday, hr, instant) %>% 
+  prep()
+```
+
+```{r}
+# rec_with_log_target <- rec %>% 
+  # add_step(step_log(all_outcomes()))
+```
+
+Let's take a look at the processed training data.
+```{r}
+train_baked <- bake(rec, new_data = NULL)
+train_baked
+```
+```{r, warning=FALSE}
+plot_data <- train_baked %>% 
+  select_if(is.numeric) %>% 
+  mutate(cnt = as.factor(cnt > mean(cnt))) %>% 
+  sample_n(200) %>% 
+  select(-yr)
+ggscatmat(plot_data, color = "cnt")
+```
+
+
+```{r}
+xgb <- boost_tree(trees = 400,
+                  sample_size = tune(),
+                  mtry = tune(),
+                  min_n = tune(),
+                  tree_depth = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression") %>% 
+  translate()
+```
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  sample_size(range = c(0, 1)),
+  finalize(mtry(), train_baked),
+  min_n(),
+  tree_depth(),
+  size = 60
+)
+```
+
+```{r}
+xgb_wflow <- workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(xgb)
+```
+
+
+```{r}
+doParallel::registerDoParallel()
+tune_xgb <- tune_race_anova(
+  xgb_wflow,
+  resamples = slid_per,
+  grid = xgb_grid,
+  control = control_race(save_pred = TRUE),
+  metrics = metric_set(rmse, mape)
+)
+```
+
+```{r}
+best_xgb <- select_best(tune_xgb, metric = "rmse")
+best_xgb
+```
+
+```{r}
+final_xgb_wflow <- xgb_wflow %>% 
+  finalize_workflow(best_xgb) %>% 
+  fit(train)
+```
+
+```{r}
+preds <- predict(final_xgb_wflow, new_data = test)
+```
+
+```{r}
+result <- test %>% 
+  bind_cols(
+    preds %>% 
+      rename(preds = .pred)
+    )
+  
+result %>% metrics(truth = cnt, estimate = preds)
+```
+

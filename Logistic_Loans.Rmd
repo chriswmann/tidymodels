@@ -210,7 +210,7 @@ We are now predicting many more of the `Defaults`, although this is at the expen
 
 ```{r}
 binom_recipe %>% 
-  step_other(home_ownership, other = "the_rest") %>% 
+  step_other(purpose, other = "the_rest") %>% 
   step_dummy(purpose, home_ownership) %>%
   step_center(all_predictors()) %>% 
   step_scale(all_predictors()) %>% 

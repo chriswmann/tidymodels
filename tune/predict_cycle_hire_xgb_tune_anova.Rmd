@@ -1,5 +1,5 @@
 ---
-title: "Tidymodels Tune"
+title: "Predicting Bicycle Lending"
 author: "Chris Mann"
 date: ""
 output:
@@ -15,6 +15,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ```{r}
+library(embed)
 library(GGally)
 library(finetune)
 library(tidymodels)
@@ -23,7 +24,8 @@ library(tidyverse)
 
 ```{r}
 set.seed(2021)
-df <- read_csv("https://raw.githubusercontent.com/marcopeix/predict-bike-rentals/master/bike_rental_hour.csv")
+doParallel::registerDoParallel()
+df <- read_csv("https://raw.githubusercontent.com/chriswmann/datasets/master/UCI_ML_Repository/Bike-Sharing-Dataset/hour.csv")
 ```
 
 First we'll split the data to keep a small test set, taking the chronologically latest 10% of the data.
@@ -37,71 +39,53 @@ test <- df[df$dteday > train_test_split_date, ]
 
 Before we start mutating the data, we'll resample the training set for cross-validation.
 ```{r}
-slid_per <- sliding_period(train, index = dteday, period = "month")
+slid_per <- sliding_period(train, index = dteday, period = "quarter")
 ```
 
 We'll recode the seasons and weather as well as take the sine and cosine of `hr` to encode it numerically.
 
-The seasons are:
-1. Spring
-2. Summer
-3. Autumn
-4. Winter
-
-It seems likely that more people will cycle in nicer weather and less in winter.  Let's encode season based on the average count for each season in the training data.
-
-```{r}
-seasons <- train %>% 
-  group_by(season) %>% 
-  summarise(avg_cnt = mean(cnt)) %>% 
-  mutate(levels = scale(avg_cnt)) %>% 
-  select(-avg_cnt)
-
-season_key = as.list(seasons$levels)
-names(season_key) = seasons$season
-season_key
-```
-
-Similarly for weather:
-```{r}
-weather <- train %>% 
-  group_by(weathersit) %>% 
-  summarise(avg_cnt = mean(cnt)) %>% 
-  mutate(levels = scale(avg_cnt)) %>% 
-  select(-avg_cnt)
-
-weather_key = as.list(weather$levels)
-names(weather_key) = weather$weather
-weather_key
-```
-Now we can build out recipe.
+Let's build out recipe.
 ```{r}
 rec <- df %>% 
   recipe(cnt ~ .)
 
-rec <- rec %>% 
-  step_rm(casual, registered) %>% 
+rec_basic <- rec %>% 
   step_mutate(
-    season = recode(season, !!!season_key),
-    weathersit = recode(weathersit, !!!weather_key),
     hr_sin = sin(hr),
     hr_cos = cos(hr)
     ) %>% 
   step_date(dteday) %>% 
-  step_rm(dteday, hr, instant) %>% 
+  # Drop the subsets of the target plus processed features
+  step_rm(casual, registered, dteday, hr, instant) %>% 
   prep()
+rec_basic %>% summary()
 ```
 
-```{r}
-# rec_with_log_target <- rec %>% 
-  # add_step(step_log(all_outcomes()))
+```{r, cache=TRUE}
+rec_encoded <- rec_basic %>% 
+  step_mutate(weather = as.factor(weathersit),
+              season = as.factor(season),
+              weekday = as.factor(weekday)) %>% 
+  step_lencode_mixed(weather, outcome = vars(cnt)) %>% 
+  step_lencode_mixed(season, outcome = vars(cnt)) %>% 
+  step_lencode_mixed(weekday, outcome = vars(cnt)) %>% 
+  step_zv(all_predictors()) %>% 
+  prep()
+
+rec_encoded %>% summary()
 ```
 
 Let's take a look at the processed training data.
 ```{r}
-train_baked <- bake(rec, new_data = NULL)
+train_baked <- bake(rec_basic, new_data = NULL)
 train_baked
 ```
+
+```{r}
+train_encoded_baked <- bake(rec_encoded, new_data = NULL)
+train_encoded_baked
+```
+
 ```{r, warning=FALSE}
 plot_data <- train_baked %>% 
   select_if(is.numeric) %>% 
@@ -111,9 +95,9 @@ plot_data <- train_baked %>%
 ggscatmat(plot_data, color = "cnt")
 ```
 
-
+## Create Model Spec
 ```{r}
-xgb <- boost_tree(trees = 400,
+xgb <- boost_tree(trees = 1000,
                   sample_size = tune(),
                   mtry = tune(),
                   min_n = tune(),
@@ -123,27 +107,28 @@ xgb <- boost_tree(trees = 400,
   translate()
 ```
 
+## Create Basic Workflow
+```{r}
+xgb_basic_wflow <- workflow() %>% 
+  add_recipe(rec_basic) %>% 
+  add_model(xgb)
+```
+
+## Create Hyperparameter Search Grid
 ```{r}
 xgb_grid <- grid_latin_hypercube(
   sample_size(range = c(0, 1)),
   finalize(mtry(), train_baked),
   min_n(),
   tree_depth(),
-  size = 60
+  size = 30
 )
 ```
 
+## Tune Model with Basic Workflow
 ```{r}
-xgb_wflow <- workflow() %>% 
-  add_recipe(rec) %>% 
-  add_model(xgb)
-```
-
-
-```{r}
-doParallel::registerDoParallel()
-tune_xgb <- tune_race_anova(
-  xgb_wflow,
+tune_basic_xgb <- tune_race_anova(
+  xgb_basic_wflow,
   resamples = slid_per,
   grid = xgb_grid,
   control = control_race(save_pred = TRUE),
@@ -152,27 +137,123 @@ tune_xgb <- tune_race_anova(
 ```
 
 ```{r}
-best_xgb <- select_best(tune_xgb, metric = "rmse")
-best_xgb
+best_basic_xgb <- select_best(tune_basic_xgb, metric = "rmse")
+best_basic_xgb
 ```
 
 ```{r}
-final_xgb_wflow <- xgb_wflow %>% 
-  finalize_workflow(best_xgb) %>% 
+final_xgb_basic_wflow <- xgb_basic_wflow %>% 
+  finalize_workflow(best_basic_xgb) %>% 
   fit(train)
 ```
 
 ```{r}
-preds <- predict(final_xgb_wflow, new_data = test)
+preds_basic <- predict(final_xgb_basic_wflow, new_data = test)
 ```
 
 ```{r}
-result <- test %>% 
+result_basic <- test %>% 
   bind_cols(
-    preds %>% 
+    preds_basic %>% 
       rename(preds = .pred)
     )
   
-result %>% metrics(truth = cnt, estimate = preds)
+metrics_basic <- result_basic %>% metrics(truth = cnt, estimate = preds)
+metrics_basic
 ```
 
+## Create New Workflow with Bayesian Encoded Categoricals
+```{r}
+xgb_encoded_wflow <- xgb_basic_wflow %>% 
+  update_recipe(recipe = rec_encoded)
+```
+
+## Tune Model with Encoded Workflow
+```{r}
+tune_encoded_xgb <- tune_race_anova(
+  xgb_encoded_wflow,
+  resamples = slid_per,
+  grid = xgb_grid,
+  control = control_race(save_pred = TRUE),
+  metrics = metric_set(rmse, mape)
+)
+best_encoded_xgb <- select_best(tune_encoded_xgb, metric = "rmse")
+best_encoded_xgb
+```
+
+```{r}
+final_xgb_encoded_wflow <- xgb_encoded_wflow %>% 
+  finalize_workflow(best_encoded_xgb) %>% 
+  fit(train)
+```
+
+```{r}
+preds_encoded <- predict(final_xgb_encoded_wflow, new_data = test)
+```
+
+```{r}
+result_encoded <- test %>% 
+  bind_cols(
+    preds_encoded %>% 
+      rename(preds = .pred)
+    )
+  
+metrics_encoded <- result_encoded %>% metrics(truth = cnt, estimate = preds)
+metrics_encoded
+```
+The additional encoding reduce the RMSE by `r round(metrics_basic$.estimate[[1]] - metrics_encoded$.estimate[[1]], 3)`.  It is still quite high though.
+```{r}
+sqrt(2024.5173066388636)
+```
+
+```{r}
+rec_improved <- rec_encoded %>% 
+  step_mutate(low_temp = as.integer(atemp < 0.3),
+              high_temp = as.integer(atemp > 0.6),
+              high_wind = as.integer(windspeed > 0.2),
+              cold_wind = low_temp + high_wind) %>% 
+  step_corr(all_numeric(), threshold = 0.99) %>% 
+  step_zv(all_predictors()) %>% 
+  prep()
+rec_improved %>% summary()
+```
+
+## Create New Workflow with Additional Features
+```{r}
+xgb_improved_wflow <- xgb_encoded_wflow %>% 
+  update_recipe(recipe = rec_improved)
+```
+
+## Tune Model with Improved Workflow
+```{r}
+tune_improved_xgb <- tune_race_anova(
+  xgb_improved_wflow,
+  resamples = slid_per,
+  grid = xgb_grid,
+  control = control_race(save_pred = TRUE),
+  metrics = metric_set(rmse, mape)
+)
+best_improved_xgb <- select_best(tune_improved_xgb, metric = "rmse")
+best_improved_xgb
+```
+
+```{r}
+final_xgb_improved_wflow <- xgb_improved_wflow %>% 
+  finalize_workflow(best_improved_xgb) %>% 
+  fit(train)
+```
+
+```{r}
+preds_improved <- predict(final_xgb_improved_wflow, new_data = test)
+```
+
+```{r}
+result_improved <- test %>% 
+  bind_cols(
+    preds_improved %>% 
+      rename(preds = .pred)
+    )
+  
+metrics_improved <- result_improved %>% metrics(truth = cnt, estimate = preds)
+metrics_improved
+```
